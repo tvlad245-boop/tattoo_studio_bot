@@ -91,3 +91,54 @@ async def send_screen_from_scratch(
         await bot.send_photo(chat_id, photo_file_id, caption=cap, parse_mode="HTML", reply_markup=reply_markup)
     else:
         await bot.send_message(chat_id, cap, parse_mode="HTML", reply_markup=reply_markup)
+
+
+async def edit_chat_ui(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    html: str,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> int:
+    """
+    Одно сообщение чата: сначала правка текста, если не получилось — подпись к фото,
+    если не вышло — удаление и новое текстовое (новый message_id).
+    """
+    cap = html if len(html) <= CAPTION_MAX else html[: CAPTION_MAX - 1] + "…"
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=html,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+        return message_id
+    except TelegramBadRequest as e:
+        low = str(e).lower()
+        if "message is not modified" in low:
+            return message_id
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=cap,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+            return message_id
+        except TelegramBadRequest as e2:
+            low2 = str(e2).lower()
+            if "message is not modified" in low2:
+                return message_id
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except TelegramBadRequest:
+                logger.debug("edit_chat_ui: delete skipped")
+            sent = await bot.send_message(
+                chat_id,
+                html,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+            return int(sent.message_id)

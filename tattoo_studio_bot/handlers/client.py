@@ -24,6 +24,7 @@ from tattoo_studio_bot.handlers.ui_media import (
     SETTING_PHOTO_ABOUT,
     SETTING_PHOTO_MAIN,
     SETTING_PHOTO_PRICE,
+    edit_chat_ui,
     present_screen,
     send_screen_from_scratch,
 )
@@ -99,22 +100,48 @@ def _questionnaire_block_html(
     return "\n".join(parts)
 
 
-async def _edit(ui: Message, text: str, kb: InlineKeyboardMarkup | None = None) -> None:
-    try:
-        await ui.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    except TelegramBadRequest as e:
-        low = str(e).lower()
-        if "message is not modified" in low:
-            return
-        logger.warning("edit_text: %s", e)
+async def _edit(
+    ui: Message,
+    text: str,
+    kb: InlineKeyboardMarkup | None = None,
+    *,
+    state: FSMContext | None = None,
+) -> None:
+    """Правка того же сообщения бота (в т.ч. было фото с подписью). Обновляет ui_message_id в state."""
+    nid = await edit_chat_ui(ui.bot, ui.chat.id, ui.message_id, text, kb)
+    if state is not None and nid != ui.message_id:
+        await state.update_data(ui_message_id=nid)
 
 
-async def _edit_or_reply(ui: Message, text: str, kb: InlineKeyboardMarkup | None = None) -> None:
-    """Для сообщений пользователя правка невозможна — отправляем новое."""
+async def _edit_or_reply(
+    ui: Message,
+    text: str,
+    kb: InlineKeyboardMarkup | None = None,
+    *,
+    state: FSMContext | None = None,
+) -> None:
+    """Как _edit; если не удалось — ответ новым сообщением (редкий случай)."""
     try:
-        await ui.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    except TelegramBadRequest:
+        await _edit(ui, text, kb, state=state)
+    except Exception:
         await ui.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def _edit_from_state(
+    bot: Bot,
+    state: FSMContext,
+    html: str,
+    kb: InlineKeyboardMarkup | None,
+) -> None:
+    data = await state.get_data()
+    cid = data.get("ui_chat_id")
+    mid = data.get("ui_message_id")
+    if cid is None or mid is None:
+        logger.warning("_edit_from_state: нет якоря ui_chat_id/ui_message_id")
+        return
+    nid = await edit_chat_ui(bot, int(cid), int(mid), html, kb)
+    if nid != int(mid):
+        await state.update_data(ui_message_id=nid)
 
 
 async def _resolve_booking_id(conn, uid: int, state_data: dict[str, Any]) -> int:
@@ -188,7 +215,7 @@ def _kb_for_step(step: dict[str, Any]) -> InlineKeyboardMarkup:
 
 
 async def render_questionnaire_step(
-    ui: Message,
+    bot: Bot,
     conn,
     booking_id: int,
     user_id: int,
@@ -198,7 +225,12 @@ async def render_questionnaire_step(
 ) -> None:
     draft = await booking_svc.get_draft_for_user(conn, user_id)
     if not draft:
-        await _edit_or_reply(ui, "<b>Черновик не найден.</b> Нажмите /start", None)
+        await _edit_from_state(
+            bot,
+            state,
+            "<b>Черновик не найден.</b> Нажмите /start",
+            None,
+        )
         return
 
     vid = int(draft["questionnaire_version_id"])
@@ -208,7 +240,7 @@ async def render_questionnaire_step(
     if slug is None:
         tz = await get_timezone(conn, settings.default_timezone)
         await state.set_state(BookingFlow.calendar)
-        await _render_calendar_month(ui, conn, settings, tz)
+        await _render_calendar_month(bot, state, conn, settings, tz)
         return
 
     step = next(s for s in steps if s["slug"] == slug)
@@ -223,18 +255,27 @@ async def render_questionnaire_step(
 
     text = _questionnaire_block_html(steps, slug, step["title"], extra)
 
-    await _edit_or_reply(ui, text, _kb_for_step(step))
+    await _edit_from_state(bot, state, text, _kb_for_step(step))
 
 
-async def _render_calendar_month(ui: Message, conn, settings: Settings, tz_name: str) -> None:
+async def _render_calendar_month(
+    bot: Bot,
+    state: FSMContext,
+    conn,
+    settings: Settings,
+    tz_name: str,
+) -> None:
     from zoneinfo import ZoneInfo
 
     today = datetime.now(ZoneInfo(tz_name)).date()
     disabled = await slot_svc.calendar_disabled_dates_for_month(conn, today.year, today.month, tz_name)
     kb = build_month_keyboard(today.year, today.month, tz_name, disabled_dates=disabled)
-    await _edit(
-        ui,
-        "<b>Выберите дату</b>\n\nДни с ❌ недоступны (прошлое, нет окна записи, закрыто или нет свободных слотов).",
+    await _edit_from_state(
+        bot,
+        state,
+        "<b>Выберите дату</b>\n\n"
+        "Дни с ❌: прошлое, вне окна записи или день закрыт администратором.\n"
+        "После выбора даты показываются доступные слоты (если их задали в БД).",
         kb,
     )
 
@@ -415,8 +456,19 @@ async def _handle_menu(
             booking_id = await booking_svc.create_draft(conn, cb.from_user.id, vid)
 
         await state.clear()
-        await state.update_data(booking_id=booking_id)
-        await render_questionnaire_step(cb.message, conn, booking_id, cb.from_user.id, settings=settings, state=state)
+        await state.update_data(
+            booking_id=booking_id,
+            ui_chat_id=cb.message.chat.id,
+            ui_message_id=cb.message.message_id,
+        )
+        await render_questionnaire_step(
+            cb.bot,
+            conn,
+            booking_id,
+            cb.from_user.id,
+            settings=settings,
+            state=state,
+        )
         await cb.answer()
         return
 
@@ -428,34 +480,36 @@ async def _restore_booking_flow(cb: CallbackQuery, state: FSMContext, conn, sett
         await cb.answer("Черновик устарел.", show_alert=True)
         return
 
+    await state.update_data(
+        booking_id=booking_id,
+        ui_chat_id=cb.message.chat.id,
+        ui_message_id=cb.message.message_id,
+    )
+
     vid = int(draft["questionnaire_version_id"])
     steps = await questionnaire_svc.load_steps_for_version(conn, vid)
     answers = draft["answers"]
 
     if not _questionnaire_finished(steps, answers):
-        await state.update_data(booking_id=booking_id)
-        await render_questionnaire_step(cb.message, conn, booking_id, uid, settings=settings, state=state)
+        await render_questionnaire_step(cb.bot, conn, booking_id, uid, settings=settings, state=state)
         await cb.answer()
         return
 
     if draft["slot_id"] is None:
         tz = await get_timezone(conn, settings.default_timezone)
         await state.set_state(BookingFlow.calendar)
-        await state.update_data(booking_id=booking_id)
-        await _render_calendar_month(cb.message, conn, settings, tz)
+        await _render_calendar_month(cb.bot, state, conn, settings, tz)
         await cb.answer()
         return
 
     if draft["master_id"] is None:
         await state.set_state(BookingFlow.masters)
-        await state.update_data(booking_id=booking_id)
-        await _render_masters(cb.message, conn, settings, booking_id, uid)
+        await _render_masters(cb.bot, state, conn, settings, booking_id, uid)
         await cb.answer()
         return
 
     await state.set_state(BookingFlow.confirm)
-    await state.update_data(booking_id=booking_id)
-    await _render_confirm(cb.message, conn, settings, booking_id)
+    await _render_confirm(cb.bot, state, conn, settings, booking_id)
     await cb.answer()
 
 
@@ -540,13 +594,14 @@ async def _handle_question(
                         [InlineKeyboardButton(text="⬅ В меню", callback_data=cb_client(("menu", "open")))]
                     ]
                 ),
+                state=state,
             )
             await cb.answer()
             return
 
         answers[slug] = opt
         await booking_svc.save_answers_partial(conn, booking_id, uid, answers, slug)
-        await render_questionnaire_step(cb.message, conn, booking_id, uid, settings=settings, state=state)
+        await render_questionnaire_step(cb.bot, conn, booking_id, uid, settings=settings, state=state)
         await cb.answer()
         return
 
@@ -567,14 +622,14 @@ async def _handle_question(
         if mode == "skip":
             answers[slug] = []
             await booking_svc.save_answers_partial(conn, booking_id, uid, answers, slug)
-            await render_questionnaire_step(cb.message, conn, booking_id, uid, settings=settings, state=state)
+            await render_questionnaire_step(cb.bot, conn, booking_id, uid, settings=settings, state=state)
             await cb.answer()
             return
 
         if mode == "no":
             answers[slug] = []
             await booking_svc.save_answers_partial(conn, booking_id, uid, answers, slug)
-            await render_questionnaire_step(cb.message, conn, booking_id, uid, settings=settings, state=state)
+            await render_questionnaire_step(cb.bot, conn, booking_id, uid, settings=settings, state=state)
             await cb.answer()
             return
 
@@ -603,7 +658,7 @@ async def _handle_question(
                 step["title"],
                 f"Пришлите до {max_files} фото (JPEG, PNG, WebP).\nПосле загрузки нажмите «Готово».",
             )
-            await _edit(cb.message, ptext, kb)
+            await _edit(cb.message, ptext, kb, state=state)
             await cb.answer()
             return
 
@@ -613,7 +668,7 @@ async def _handle_question(
             answers[slug] = items
             await booking_svc.save_answers_partial(conn, booking_id, uid, answers, slug)
             await state.set_state(BookingFlow.questionnaire)
-            await render_questionnaire_step(cb.message, conn, booking_id, uid, settings=settings, state=state)
+            await render_questionnaire_step(cb.bot, conn, booking_id, uid, settings=settings, state=state)
             await cb.answer()
             return
 
@@ -635,8 +690,10 @@ async def _handle_calendar(
         kb = build_month_keyboard(y, m, tz, disabled_dates=disabled)
         await _edit(
             cb.message,
-            "<b>Выберите дату</b>\n\nДни с ❌ недоступны (прошлое, нет окна записи, закрыто или нет свободных слотов).",
+            "<b>Выберите дату</b>\n\n"
+            "Дни с ❌: прошлое, вне окна записи или день закрыт администратором.",
             kb,
+            state=state,
         )
         await cb.answer()
         return
@@ -654,7 +711,11 @@ async def _handle_calendar(
         if booking_id == 0:
             await cb.answer("Сессия устарела. /start", show_alert=True)
             return
-        await state.update_data(booking_id=booking_id)
+        await state.update_data(
+            booking_id=booking_id,
+            ui_chat_id=cb.message.chat.id,
+            ui_message_id=cb.message.message_id,
+        )
 
         slots = await slot_svc.list_slots_for_day(conn, picked)
         await state.set_state(BookingFlow.slots)
@@ -691,14 +752,18 @@ async def _handle_calendar(
         if not slots:
             await _edit(
                 cb.message,
-                "<b>Нет свободных слотов</b> на этот день.\nВыберите другую дату.",
+                "<b>Нет свободных слотов</b> на этот день.\n"
+                "Слоты добавляются в базе данных; дни без записей в расписании пустые.\n"
+                "Выберите другую дату или другой месяц.",
                 kb,
+                state=state,
             )
         else:
             await _edit(
                 cb.message,
                 f"<b>Время на {picked.isoformat()}</b>\nВыберите слот.",
                 kb,
+                state=state,
             )
         await cb.answer()
         return
@@ -722,12 +787,13 @@ async def _handle_slot_pick(
 
     await booking_svc.set_draft_slot(conn, booking_id, uid, slot_id)
     await state.set_state(BookingFlow.masters)
-    await _render_masters(cb.message, conn, settings, booking_id, uid)
+    await _render_masters(cb.bot, state, conn, settings, booking_id, uid)
     await cb.answer()
 
 
 async def _render_masters(
-    ui: Message,
+    bot: Bot,
+    state: FSMContext,
     conn,
     settings: Settings,
     booking_id: int,
@@ -735,13 +801,13 @@ async def _render_masters(
 ) -> None:
     draft = await booking_svc.get_draft_for_user(conn, user_id)
     if not draft or int(draft["id"]) != booking_id or draft["slot_id"] is None:
-        await _edit_or_reply(ui, "<b>Ошибка черновика.</b> /start", None)
+        await _edit_from_state(bot, state, "<b>Ошибка черновика.</b> /start", None)
         return
 
     slot_id = int(draft["slot_id"])
     sl = await slot_svc.get_slot(conn, slot_id)
     if not sl:
-        await _edit_or_reply(ui, "<b>Слот не найден.</b>", None)
+        await _edit_from_state(bot, state, "<b>Слот не найден.</b>", None)
         return
 
     picked = date_cls.fromisoformat(str(sl["work_date"]))
@@ -811,14 +877,15 @@ async def _render_masters(
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
     if not any_free:
-        await _edit(
-            ui,
+        await _edit_from_state(
+            bot,
+            state,
             "<b>Нет свободных мастеров</b> на это время.\nВернитесь к выбору слота.",
             kb,
         )
         return
 
-    await _edit_or_reply(ui, "<b>Выберите мастера</b>", kb)
+    await _edit_from_state(bot, state, "<b>Выберите мастера</b>", kb)
 
 
 async def _handle_master_pick(
@@ -865,11 +932,17 @@ async def _handle_master_pick(
 
     await booking_svc.set_draft_master(conn, booking_id, uid, mid)
     await state.set_state(BookingFlow.confirm)
-    await _render_confirm(cb.message, conn, settings, booking_id)
+    await _render_confirm(cb.bot, state, conn, settings, booking_id)
     await cb.answer()
 
 
-async def _render_confirm(ui: Message, conn, settings: Settings, booking_id: int) -> None:
+async def _render_confirm(
+    bot: Bot,
+    state: FSMContext,
+    conn,
+    settings: Settings,
+    booking_id: int,
+) -> None:
     html = await build_summary_html(conn, booking_id=booking_id)
     if not html:
         html = "Не удалось построить сводку."
@@ -887,7 +960,7 @@ async def _render_confirm(ui: Message, conn, settings: Settings, booking_id: int
             [InlineKeyboardButton(text="⬅ В меню", callback_data=cb_client(("menu", "open")))],
         ]
     )
-    await _edit(ui, html, kb)
+    await _edit_from_state(bot, state, html, kb)
 
 
 async def _handle_confirm(
@@ -909,7 +982,7 @@ async def _handle_confirm(
 
     if action == "back":
         await state.set_state(BookingFlow.masters)
-        await _render_masters(cb.message, conn, settings, booking_id, uid)
+        await _render_masters(cb.bot, state, conn, settings, booking_id, uid)
         await cb.answer()
         return
 
@@ -952,7 +1025,7 @@ async def question_other_text(msg: Message, state: FSMContext, conn, settings: S
     await booking_svc.save_answers_partial(conn, booking_id, uid, answers, slug)
 
     await state.set_state(BookingFlow.questionnaire)
-    await render_questionnaire_step(msg, conn, booking_id, uid, settings=settings, state=state)
+    await render_questionnaire_step(msg.bot, conn, booking_id, uid, settings=settings, state=state)
 
 
 @client_router.message(StateFilter(BookingFlow.questionnaire), F.text)
@@ -983,7 +1056,7 @@ async def question_plain_text(msg: Message, state: FSMContext, conn, settings: S
     answers = dict(draft["answers"])
     answers[slug] = text
     await booking_svc.save_answers_partial(conn, booking_id, uid, answers, slug)
-    await render_questionnaire_step(msg, conn, booking_id, uid, settings=settings, state=state)
+    await render_questionnaire_step(msg.bot, conn, booking_id, uid, settings=settings, state=state)
 
 
 @client_router.message(StateFilter(BookingFlow.questionnaire_photos), F.photo)

@@ -12,33 +12,13 @@ from tattoo_studio_bot.utils.booking_window import date_in_booking_window
 logger = logging.getLogger(__name__)
 
 
-async def day_has_bookable_slot(conn: aiosqlite.Connection, d: date) -> bool:
-    """Есть ли хотя бы один слот на дату, доступный для новой записи."""
-    ds = d.isoformat()
-    async with conn.execute(
-        """
-        SELECT id, studio_blocked FROM slots WHERE work_date = ?
-        ORDER BY start_time ASC
-        """,
-        (ds,),
-    ) as cur:
-        rows = await cur.fetchall()
-    if not rows:
-        return False
-    for r in rows:
-        if r["studio_blocked"]:
-            continue
-        if await is_slot_available(conn, int(r["id"])):
-            return True
-    return False
-
-
 async def calendar_disabled_dates_for_month(
     conn: aiosqlite.Connection, year: int, month: int, tz_name: str
 ) -> frozenset[str]:
     """
-    Все дни месяца, которые нельзя выбрать: прошлое, вне окна бронирования,
-    закрыты админом, нет ни одного свободного слота.
+    Дни без выбора в календаре: прошлое, вне окна бронирования, явно закрыты админом.
+
+    Наличие слотов в БД проверяется после выбора дня (иначе без слотов все дни «закрыты»).
     """
     from calendar import monthrange
     from datetime import datetime
@@ -62,11 +42,26 @@ async def calendar_disabled_dates_for_month(
         if ds in closed:
             disabled.add(ds)
             continue
-        if not await day_has_bookable_slot(conn, d):
-            disabled.add(ds)
-            continue
 
     return frozenset(disabled)
+
+
+async def toggle_work_day_closed(conn: aiosqlite.Connection, d: date) -> bool:
+    """Переключает признак «день закрыт админом». Возвращает новое значение is_closed."""
+    ds = d.isoformat()
+    async with conn.execute("SELECT is_closed FROM work_days WHERE work_date = ?", (ds,)) as cur:
+        row = await cur.fetchone()
+    cur_closed = bool(row and int(row[0]))
+    new_val = 0 if cur_closed else 1
+    await conn.execute(
+        """
+        INSERT INTO work_days (work_date, is_closed) VALUES (?, ?)
+        ON CONFLICT(work_date) DO UPDATE SET is_closed = excluded.is_closed
+        """,
+        (ds, new_val),
+    )
+    await conn.commit()
+    return bool(new_val)
 
 
 async def day_closed(conn: aiosqlite.Connection, d: date) -> bool:
