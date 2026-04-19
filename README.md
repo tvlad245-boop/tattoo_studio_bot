@@ -39,7 +39,9 @@ Python 3.10+ (в ТЗ — 3.11+), **aiogram 3.x**, **SQLite** (aiosqlite), FSM: 
 
 1. Скопировать `.env.example` → `.env`, указать `BOT_TOKEN`, `ADMIN_IDS`.
 2. `pip install -r requirements.txt`
-3. Из каталога проекта (родитель пакета): `python -m tattoo_studio_bot`
+3. Из **корня репозитория** (рядом с `requirements.txt`): `python -m tattoo_studio_bot`
+
+На хостинге задайте рабочую директорию корнем репозитория и команду запуска либо `python -m tattoo_studio_bot`, либо `python tattoo_studio_bot/main.py` (в `main.py` добавлен `sys.path` для такого варианта). Не запускайте `main.py` из другой папки без указания корня проекта.
 
 Для смоук-теста добавьте хотя бы один слот на нужную дату в таблицу `slots` (или через будущую админку).
 

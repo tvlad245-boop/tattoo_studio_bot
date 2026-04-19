@@ -4,6 +4,14 @@ import asyncio
 import logging
 import sys
 import traceback
+from pathlib import Path
+
+# При запуске вида python tattoo_studio_bot/main.py (часто на хостингах) в sys.path нет
+# родителя пакета — импорт tattoo_studio_bot.* падает. Добавляем корень репозитория.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_repo = str(_REPO_ROOT)
+if _repo not in sys.path:
+    sys.path.insert(0, _repo)
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
